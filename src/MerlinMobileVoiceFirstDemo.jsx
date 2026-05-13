@@ -327,16 +327,72 @@ const fmtTime = () => {
   return `${h12}:${String(d.getMinutes()).padStart(2, '0')} ${d.getHours() >= 12 ? 'PM' : 'AM'}`;
 };
 
+/* ---------- Multi-segment samples ----------
+   A single voice note that the AI splits across multiple sub-modules.
+   Each segment becomes its own Activity Timeline entry on save. */
+const MULTI_SEGMENT_SAMPLES = [
+  {
+    title: 'Crew on site · concrete delivered · Bobcat issue',
+    spoken: "Joe and Marcus on site at 7 AM. ABC Concrete dropped 5 yards, looked good. Bobcat's running rough — flag it for maintenance.",
+    segments: [
+      {
+        category: 'Personnel',
+        match: 'matched',
+        title: 'Joe + Marcus on site at 7 AM',
+        summary: 'Joe Smith and Marcus Lee on site at 7:00 AM. Matched to project crew roster.',
+        entities: [
+          { k: 'Joe Smith',  v: 'Carpenter', check: true },
+          { k: 'Marcus Lee', v: 'Laborer',   check: true },
+          { k: 'Start',      v: '7:00 AM' },
+        ],
+        sideEffects: [
+          { icon: Users, label: 'Added to "On-Site Crew" on Daily Report' },
+        ],
+      },
+      {
+        category: 'Deliveries',
+        match: 'matched',
+        title: 'ABC Concrete · 5 yards received',
+        summary: 'ABC Concrete delivered 5 yards. Received in good condition. Cost-track stub created pending PO match.',
+        entities: [
+          { k: 'Supplier',  v: 'ABC Concrete ✓' },
+          { k: 'Quantity',  v: '5 yards' },
+          { k: 'Status',    v: 'Received', okay: true },
+        ],
+        sideEffects: [
+          { icon: Truck,   label: 'Added to "Materials Delivered" on Daily Report' },
+          { icon: Package, label: 'Cost-track stub created · awaits PO match' },
+        ],
+      },
+      {
+        category: 'Equipments',
+        match: 'confirm-match',
+        title: 'Bobcat E26 · maintenance flagged',
+        summary: 'Bobcat E26 reported running rough — flagged for maintenance.',
+        entities: [
+          { k: 'Heard', v: '"Bobcat"' },
+          { k: 'Match', v: 'Bobcat E26 ✓', changeable: true },
+          { k: 'Flag',  v: 'Needs maintenance', warn: true },
+        ],
+        sideEffects: [
+          { icon: Wrench, label: 'Equipment fault ticket drafted for Bobcat E26' },
+        ],
+      },
+    ],
+  },
+];
+
 const makeFreeCapture = (sample) => ({
   title:       sample.title,
   time:        fmtTime(),
   spoken:      sample.spoken,
   summary:     sample.summary,
   category:    sample.category,
-  chip:        CHIP_FROM_CATEGORY(sample.category),
+  chip:        sample.category ? CHIP_FROM_CATEGORY(sample.category) : null,
   extraChips:  (sample.extraCategories || []).map(CHIP_FROM_CATEGORY),
   entities:    sample.entities,
   sideEffects: sample.sideEffects,
+  segments:    sample.segments,
 });
 
 /* ---------- Mock crew roster ----------
@@ -481,11 +537,20 @@ export default function App() {
   });
   const [planItems, setPlanItems] = useState(DAILY_PLAN);
 
+  /* Pool of samples for the free-form mic flow.
+     First tap shows the multi-segment scenario so the segregation
+     behavior is reliably visible during a client demo; subsequent
+     taps cycle through single-category examples. */
+  const FREE_POOL = useRef([...MULTI_SEGMENT_SAMPLES, ...FREE_SAMPLES]);
+  const freeIdx = useRef(0);
+
   /* Free-form voice capture (non-tour mode):
-     pick a random sample, type out transcript, "analyze", show review */
+     pick the next sample, type out transcript, "analyze", show review */
   const startFreeCapture = () => {
     if (tour.active && tour.playing) return;
-    const sample = FREE_SAMPLES[Math.floor(Math.random() * FREE_SAMPLES.length)];
+    const pool = FREE_POOL.current;
+    const sample = pool[freeIdx.current % pool.length];
+    freeIdx.current += 1;
     const capture = makeFreeCapture(sample);
     setVoiceState({ phase: 'recording', transcript: '', categoryIdx: -1, capture });
     setScreen('voice');
@@ -526,6 +591,32 @@ export default function App() {
       },
       ...prev,
     ]);
+    setVoiceState({ phase: 'idle', transcript: '', categoryIdx: 0, capture: null });
+    setScreen('detail');
+  };
+
+  /* When a single voice note was segregated by the AI into multiple
+     sub-modules, each confirmed segment becomes its own timeline entry.
+     They share the spoken text but get their own chip / summary / fields. */
+  const saveSegmentedCapture = (segments) => {
+    const cap = voiceState.capture;
+    if (!cap || !segments || segments.length === 0) { setScreen('detail'); return; }
+    const stamp = Date.now();
+    const newEntries = segments.map((seg, i) => ({
+      id: `MS${stamp}-${i}`,
+      title: seg.title,
+      time: cap.time,
+      text: cap.spoken,
+      summary: seg.summary,
+      category: seg.category,
+      chip: CHIP_FROM_CATEGORY(seg.category),
+      extraChips: [],
+      entities: seg.entities,
+      sideEffects: seg.sideEffects || [],
+      user: USER.name,
+      userInitials: USER.initials,
+    }));
+    setActivity(prev => [...newEntries, ...prev]);
     setVoiceState({ phase: 'idle', transcript: '', categoryIdx: 0, capture: null });
     setScreen('detail');
   };
@@ -665,6 +756,7 @@ export default function App() {
                                        setVoiceState={setVoiceState}
                                        tour={tour}
                                        onSave={tour.active ? () => {} : saveFreeCapture}
+                                       onSaveSegments={tour.active ? () => {} : saveSegmentedCapture}
                                      />}
           {screen === 'clockin'  && <ClockInScreen       setScreen={setScreen} clockedInAt={clockedInAt} setClockedInAt={setClockedInAt} />}
           {screen === 'morning'  && <MorningReportScreen setScreen={setScreen} />}
@@ -1915,13 +2007,26 @@ function VoiceScreen({ setScreen, voiceState, tour }) {
    SCREEN 5 — REVIEW & SAVE
    AI-categorized + extracted entities, editable before save
    ============================================================ */
-function ReviewScreen({ setScreen, voiceState, setVoiceState, tour, onSave }) {
+function ReviewScreen({ setScreen, voiceState, setVoiceState, tour, onSave, onSaveSegments }) {
   const step = voiceState.capture || TOUR[voiceState.categoryIdx];
   const [pickerOpen, setPickerOpen] = useState(false);
 
   const CATEGORY_OPTIONS = [...Object.keys(FREE_CATEGORIES), 'Change Order'];
 
   if (!step) return null;
+
+  // When the AI split this voice note across multiple sub-modules,
+  // render the segmented review (per-item Confirm / Edit / Confirm all).
+  if (step.segments && step.segments.length > 0) {
+    return (
+      <SegmentedReviewBody
+        step={step}
+        setScreen={setScreen}
+        onSaveSegments={onSaveSegments}
+      />
+    );
+  }
+
   const Icon = step.chip.icon;
 
   const changeCategory = (newCat) => {
@@ -2072,6 +2177,441 @@ function ReviewScreen({ setScreen, voiceState, setVoiceState, tour, onSave }) {
           Save to Activity Timeline
         </button>
       </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   SEGMENTED REVIEW — single voice note → multiple sub-module items
+   The AI split the spoken note across categories. Field user
+   confirms or edits each item, then "Confirm all" saves each
+   segment as its own Activity Timeline entry.
+   ============================================================ */
+function SegmentedReviewBody({ step, setScreen, onSaveSegments }) {
+  const [segments, setSegments] = useState(step.segments);
+  const [confirmed, setConfirmed] = useState(() => new Set());
+  // editDraft = { idx, title, summary, category } | null
+  const [editDraft, setEditDraft] = useState(null);
+  // voiceRec = { target: 'title' | 'body' } | null
+  const [voiceRec, setVoiceRec] = useState(null);
+  const voiceTimerRef = useRef(null);
+
+  const openEdit = (idx) => {
+    const s = segments[idx];
+    setEditDraft({ idx, title: s.title, summary: s.summary, category: s.category });
+  };
+  const cancelEdit = () => {
+    setEditDraft(null);
+    setVoiceRec(null);
+    if (voiceTimerRef.current) { clearTimeout(voiceTimerRef.current); voiceTimerRef.current = null; }
+  };
+  const saveEdit = () => {
+    if (!editDraft) return;
+    setSegments(prev => prev.map((s, i) => (i === editDraft.idx
+      ? { ...s, title: editDraft.title, summary: editDraft.summary, category: editDraft.category }
+      : s)));
+    setConfirmed(prev => new Set(prev).add(editDraft.idx));
+    setEditDraft(null);
+    setVoiceRec(null);
+    if (voiceTimerRef.current) { clearTimeout(voiceTimerRef.current); voiceTimerRef.current = null; }
+  };
+  const toggleConfirmed = (idx) => {
+    setConfirmed(prev => {
+      const n = new Set(prev);
+      if (n.has(idx)) n.delete(idx); else n.add(idx);
+      return n;
+    });
+  };
+
+  // Prototype voice dictation: simulate listening, then append a canned
+  // phrase to the active field. Real product would route through the
+  // same speech pipeline as the main mic capture.
+  const DICTATED = 'Also notify the office and schedule a follow-up.';
+  const startVoiceFor = (target) => {
+    if (voiceRec) return;
+    setVoiceRec({ target });
+    voiceTimerRef.current = setTimeout(() => {
+      setEditDraft(d => {
+        if (!d) return d;
+        if (target === 'title') return { ...d, title: `${d.title} — follow-up` };
+        return { ...d, summary: `${d.summary} ${DICTATED}` };
+      });
+      setVoiceRec(null);
+      voiceTimerRef.current = null;
+    }, 2200);
+  };
+  const stopVoice = () => {
+    if (voiceTimerRef.current) { clearTimeout(voiceTimerRef.current); voiceTimerRef.current = null; }
+    setVoiceRec(null);
+  };
+
+  return (
+    <div className="h-full w-full overflow-y-auto" style={{ background: C.bg }}>
+      {/* Header */}
+      <div style={{ padding: '12px 20px 8px' }} className="flex items-center justify-between">
+        <button onClick={() => setScreen('detail')}>
+          <ChevronLeft size={22} color={C.text} />
+        </button>
+        <div style={{ fontSize: 14, fontWeight: 600, color: C.text }}>Review & Save</div>
+        <div style={{ width: 22 }} />
+      </div>
+
+      {/* Transcript */}
+      <div style={{ padding: '8px 20px 0' }}>
+        <div
+          style={{
+            background: '#fff', border: `1px solid ${C.border}`, borderRadius: 12,
+            padding: '14px 16px',
+          }}
+        >
+          <div className="flex items-center justify-between" style={{ marginBottom: 8 }}>
+            <div style={{ fontSize: 11, color: C.textFaded, fontWeight: 600, letterSpacing: 0.5 }}>
+              YOU SAID · {step.time}
+            </div>
+            <button style={{ fontSize: 11, color: C.primary, fontWeight: 600 }}>Edit</button>
+          </div>
+          <div style={{ fontSize: 15, color: C.text, lineHeight: 1.5, fontStyle: 'italic' }}>
+            "{step.spoken}"
+          </div>
+        </div>
+      </div>
+
+      {/* "Here's what I caught" */}
+      <div style={{ padding: '16px 20px 0' }}>
+        <div className="flex items-center gap-1.5">
+          <Sparkles size={12} color={C.primary} />
+          <div style={{ fontSize: 11, fontWeight: 700, color: C.textFaded, letterSpacing: 0.5 }}>
+            HERE'S WHAT I CAUGHT
+          </div>
+        </div>
+        <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>
+          {segments.length} items · tap to confirm or edit
+        </div>
+      </div>
+
+      {/* Segment cards */}
+      <div style={{ padding: '12px 20px 0', display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {segments.map((seg, idx) => {
+          const chip = CHIP_FROM_CATEGORY(seg.category);
+          const SegIcon = chip.icon;
+          const isConfirmed = confirmed.has(idx);
+          const isEditing = editDraft && editDraft.idx === idx;
+
+          return (
+            <div
+              key={idx}
+              style={{
+                background: '#fff',
+                border: `1px solid ${isConfirmed ? chip.color + '70' : C.border}`,
+                borderRadius: 12,
+                padding: '12px 14px',
+                boxShadow: isConfirmed ? `0 0 0 2px ${chip.color}15` : 'none',
+                transition: 'all 0.15s',
+              }}
+            >
+              {/* Header: icon + category */}
+              <div className="flex items-center gap-2" style={{ marginBottom: 10 }}>
+                <div
+                  style={{
+                    background: chip.bg, color: chip.color,
+                    width: 26, height: 26, borderRadius: 6,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  }}
+                >
+                  <SegIcon size={14} strokeWidth={2.6} />
+                </div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>{chip.label}</div>
+              </div>
+
+              {/* Body — either read-only (Title + Body) or full editor */}
+              {isEditing ? (
+                <SegmentEditor
+                  draft={editDraft}
+                  setDraft={setEditDraft}
+                  voiceRec={voiceRec}
+                  startVoiceFor={startVoiceFor}
+                  stopVoice={stopVoice}
+                />
+              ) : (
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: C.text, lineHeight: 1.4 }}>
+                    {seg.title}
+                  </div>
+                  <div style={{ fontSize: 13, color: C.textMuted, lineHeight: 1.55, marginTop: 6 }}>
+                    {seg.summary}
+                  </div>
+                </div>
+              )}
+
+              {/* Footer buttons */}
+              <div className="flex gap-2" style={{ marginTop: 12 }}>
+                {isEditing ? (
+                  <>
+                    <button
+                      onClick={cancelEdit}
+                      className="flex items-center justify-center gap-1.5"
+                      style={{
+                        flex: 1, padding: '7px 0', borderRadius: 8,
+                        fontSize: 12, fontWeight: 600,
+                        background: '#fff', color: C.textMuted,
+                        border: `1px solid ${C.border}`,
+                      }}
+                    >
+                      <X size={12} strokeWidth={2.4} />
+                      Cancel
+                    </button>
+                    <button
+                      onClick={saveEdit}
+                      className="flex items-center justify-center gap-1.5"
+                      style={{
+                        flex: 1, padding: '7px 0', borderRadius: 8,
+                        fontSize: 12, fontWeight: 700,
+                        background: C.primary, color: '#fff',
+                      }}
+                    >
+                      <Check size={12} strokeWidth={2.8} />
+                      Save
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => openEdit(idx)}
+                      className="flex items-center justify-center gap-1.5"
+                      style={{
+                        flex: 1, padding: '7px 0', borderRadius: 8,
+                        fontSize: 12, fontWeight: 600,
+                        background: '#fff', color: C.text,
+                        border: `1px solid ${C.border}`,
+                      }}
+                    >
+                      <Pencil size={11} strokeWidth={2.4} />
+                      Edit
+                    </button>
+                    <button
+                      onClick={() => toggleConfirmed(idx)}
+                      className="flex items-center justify-center gap-1.5"
+                      style={{
+                        flex: 1, padding: '7px 0', borderRadius: 8,
+                        fontSize: 12, fontWeight: 700,
+                        background: isConfirmed ? chip.bg : C.primary,
+                        color: isConfirmed ? chip.color : '#fff',
+                        border: isConfirmed ? `1px solid ${chip.color}40` : 'none',
+                      }}
+                    >
+                      <Check size={12} strokeWidth={2.8} />
+                      {isConfirmed ? 'Confirmed' : 'Confirm'}
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Footer action bar */}
+      <div style={{ padding: '20px 20px 24px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <button
+          onClick={() => onSaveSegments(segments)}
+          style={{
+            width: '100%', padding: '14px 16px', borderRadius: 12,
+            background: C.primary, color: '#fff', fontSize: 15, fontWeight: 700,
+            boxShadow: '0 8px 16px rgba(91,45,142,0.3)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+          }}
+        >
+          <Check size={18} />
+          Confirm all ({segments.length})
+        </button>
+        <button
+          onClick={() => setScreen('detail')}
+          style={{
+            width: '100%', padding: '11px 16px', borderRadius: 12,
+            background: '#fff', color: C.textMuted, fontSize: 13, fontWeight: 600,
+            border: `1px solid ${C.border}`,
+          }}
+        >
+          Discard
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* Inline editor for a single segment: compact category dropdown + editable
+   title + body, each text field has its own mic button to dictate edits. */
+function SegmentEditor({ draft, setDraft, voiceRec, startVoiceFor, stopVoice }) {
+  const [catOpen, setCatOpen] = useState(false);
+  const curChip = CHIP_FROM_CATEGORY(draft.category);
+  const CurCatIcon = curChip.icon;
+
+  return (
+    <div style={{ padding: 10, background: C.bg, borderRadius: 8 }}>
+      {/* Category — collapsed dropdown */}
+      <div className="flex items-center gap-2" style={{ marginBottom: 10 }}>
+        <div
+          style={{
+            fontSize: 10, fontWeight: 700, color: C.textFaded,
+            letterSpacing: 0.5,
+          }}
+        >
+          CATEGORY
+        </div>
+        <button
+          onClick={() => setCatOpen(o => !o)}
+          className="flex items-center gap-1"
+          style={{
+            background: curChip.bg, color: curChip.color,
+            border: `1px solid ${curChip.color}40`,
+            fontSize: 11, fontWeight: 700,
+            padding: '3px 8px', borderRadius: 12,
+            cursor: 'pointer',
+          }}
+        >
+          <CurCatIcon size={11} strokeWidth={2.6} />
+          {curChip.label}
+          <ChevronDown
+            size={11}
+            style={{
+              marginLeft: 1,
+              transform: catOpen ? 'rotate(180deg)' : 'none',
+              transition: 'transform 0.15s',
+            }}
+          />
+        </button>
+      </div>
+      {catOpen && (
+        <div className="flex flex-wrap gap-1" style={{ marginBottom: 10 }}>
+          {Object.keys(FREE_CATEGORIES)
+            .filter(cat => cat !== draft.category)
+            .map(cat => {
+              const c = CHIP_FROM_CATEGORY(cat);
+              const CIcon = c.icon;
+              return (
+                <button
+                  key={cat}
+                  onClick={() => { setDraft(d => ({ ...d, category: cat })); setCatOpen(false); }}
+                  className="flex items-center gap-1"
+                  style={{
+                    background: '#fff', color: C.text,
+                    border: `1px solid ${C.border}`,
+                    fontSize: 10, fontWeight: 600,
+                    padding: '3px 7px', borderRadius: 12,
+                    cursor: 'pointer',
+                  }}
+                >
+                  <CIcon size={10} strokeWidth={2.4} color={C.textMuted} />
+                  {cat}
+                </button>
+              );
+            })}
+        </div>
+      )}
+
+      {/* Title */}
+      <EditorField
+        label="TITLE"
+        target="title"
+        value={draft.title}
+        onChange={(v) => setDraft(d => ({ ...d, title: v }))}
+        voiceRec={voiceRec}
+        startVoiceFor={startVoiceFor}
+        stopVoice={stopVoice}
+      />
+
+      {/* Body */}
+      <EditorField
+        label="BODY"
+        target="body"
+        multiline
+        value={draft.summary}
+        onChange={(v) => setDraft(d => ({ ...d, summary: v }))}
+        voiceRec={voiceRec}
+        startVoiceFor={startVoiceFor}
+        stopVoice={stopVoice}
+      />
+    </div>
+  );
+}
+
+function EditorField({ label, target, value, onChange, multiline, voiceRec, startVoiceFor, stopVoice }) {
+  const recording = voiceRec && voiceRec.target === target;
+  const otherRecording = voiceRec && voiceRec.target !== target;
+  const accent = recording ? '#dc2626' : C.primary;
+
+  const sharedInputStyle = {
+    width: '100%',
+    fontSize: 13,
+    padding: '7px 9px',
+    borderRadius: 8,
+    border: `1px solid ${recording ? '#dc2626' : C.border}`,
+    outline: 'none',
+    fontFamily: 'inherit',
+    lineHeight: 1.5,
+    background: '#fff',
+    color: C.text,
+    boxShadow: recording ? '0 0 0 3px rgba(220,38,38,0.12)' : 'none',
+    transition: 'box-shadow 0.15s, border-color 0.15s',
+  };
+
+  return (
+    <div style={{ marginBottom: target === 'title' ? 10 : 0 }}>
+      <div className="flex items-center justify-between" style={{ marginBottom: 4 }}>
+        <div style={{ fontSize: 10, fontWeight: 700, color: C.textFaded, letterSpacing: 0.5 }}>
+          {label}
+        </div>
+        <div className="flex items-center gap-1.5">
+          {recording && (
+            <>
+              <span
+                style={{
+                  width: 5, height: 5, borderRadius: 3,
+                  background: '#dc2626',
+                  animation: 'recDot 0.9s ease-in-out infinite',
+                  display: 'inline-block',
+                }}
+              />
+              <span style={{ fontSize: 10, fontWeight: 700, color: '#dc2626', letterSpacing: 0.3 }}>
+                Listening…
+              </span>
+              <style>{`@keyframes recDot { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }`}</style>
+            </>
+          )}
+          <button
+            onClick={() => (recording ? stopVoice() : startVoiceFor(target))}
+            disabled={otherRecording}
+            aria-label={recording ? 'Stop dictation' : 'Dictate edit'}
+            style={{
+              width: 20, height: 20, borderRadius: 10,
+              background: recording ? '#dc2626' : '#fff',
+              color: recording ? '#fff' : accent,
+              border: recording ? 'none' : `1px solid ${C.border}`,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              opacity: otherRecording ? 0.35 : 1,
+              cursor: otherRecording ? 'not-allowed' : 'pointer',
+              flexShrink: 0,
+              transition: 'all 0.15s',
+            }}
+          >
+            <Mic size={10} strokeWidth={2.6} />
+          </button>
+        </div>
+      </div>
+      {multiline ? (
+        <textarea
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          rows={3}
+          style={{ ...sharedInputStyle, resize: 'vertical', minHeight: 64 }}
+        />
+      ) : (
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          style={sharedInputStyle}
+        />
+      )}
     </div>
   );
 }
