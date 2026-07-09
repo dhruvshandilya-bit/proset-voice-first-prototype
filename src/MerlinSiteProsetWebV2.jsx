@@ -455,6 +455,7 @@ const SEED_DELIVERIES = [
 
 const SEED_INCIDENTS = [
   { id: 1, name: 'Crane move mid-day', description: 'Unexpected crane move mid-day to set 2 Arctic Corridor mods. Mod 786-A2 (first floor stairwell) had an electrical box too wide for our corridor dimension. Removed box and cut wire per Target\'s Dave Ault\'s order.', location: 'Dorm 19 corridor', severity: 'NEAR_MISS', status: 'RESOLVED', date: '11:30 AM', images: 1, reportedBy: 'Erik Odowd', flag: 'CHANGE_ORDER_TRIGGER', actionTaken: 'Issue noted on Target HSI platform with photo evidence.', aiSource: 'VOICE', confidence: 0.88, capturedAt: '11:30 AM', attachments: [{ id: 'inc-1-a1', kind: 'photo', label: '786-A2 e-box before mod', placeholder: 'ebox-before' }, { id: 'inc-1-a2', kind: 'photo', label: '786-A2 after wire cut', placeholder: 'ebox-after' }, { id: 'inc-1-a3', kind: 'video', label: 'Crane move sequence', placeholder: 'crane', durationSec: 41 }] },
+  { id: 2, name: 'Laceration on panel edge', description: 'Ricki Andrade caught his right forearm on a sheared panel bracket while stitching D19 floor 1. Bleeding through glove; wound required stitches at urgent care. Bracket edge was un-deburred.', location: 'Dorm 19 · floor 1 stitch line', severity: 'RECORDABLE', status: 'OPEN', date: 'Today', time: '1:15 PM', reportedBy: 'Erik Odowd', injuredEmployee: 'Ricki Andrade', jobTitle: 'Panel / Stitch', bodyPart: 'Right forearm', cause: 'Un-deburred panel bracket edge', firstAidByWhom: 'Erik Odowd', sentToMedical: true, medicalLocation: 'Banner Urgent Care · Phoenix', daysLost: 0, restrictedDutyDays: 3, witnessNames: ['Jose Garcia', 'David Hernandez'], actionTaken: 'Wound cleaned and wrapped on site; driven to urgent care. Bracket lot pulled and flagged to fab for deburring. Light-duty assignment for 3 days.', impactHours: 1.5, aiSource: 'VOICE', confidence: 0.9, capturedAt: '1:20 PM', attachments: [{ id: 'inc-2-a1', kind: 'photo', label: 'Sheared bracket edge', placeholder: 'ebox-before' }] },
 ];
 
 const SEED_INSPECTIONS = [
@@ -2537,10 +2538,182 @@ const IncidentsDelaysTab = ({ incidents = [], problems = [], reportText, comment
   );
 };
 
+// ---------------------------------------------------------------------------
+// OSHA report — generate an OSHA 301 Injury & Illness Incident Report plus the
+// matching OSHA 300 Log line from an incident. Recordability is auto-determined
+// from severity (SEV_META.osha) and treatment outcome. In production this maps
+// to /api/v1/incidents/:id/osha and produces the signed PDF forms.
+// ---------------------------------------------------------------------------
+const OSHA_ESTABLISHMENT = { company: 'ProSet Modular, LLC', site: `${PROJECTS[0].name} · ${PROJECTS[0].address}` };
+
+// Which OSHA 300 Log classification column (G/H/I/J) a severity maps to.
+const OSHA_CLASS_COLS = [
+  { id: 'G', label: 'Death',                       sev: ['FATAL'] },
+  { id: 'H', label: 'Days away from work',         sev: ['LOST_TIME'] },
+  { id: 'I', label: 'Job transfer / restriction',  sev: [] },
+  { id: 'J', label: 'Other recordable case',       sev: ['RECORDABLE'] },
+];
+
+const oshaCaseNo = (entry) => `PS-${String(entry.id).padStart(4, '0')}`;
+
+const OSHAReportDialog = ({ entry, onClose }) => {
+  const [filed, setFiled] = useState(!!entry.reportedToOsha);
+  const sev = SEV_META[entry.severity] || {};
+  // Recordable if severity is OSHA-flagged, or treatment outcome makes it recordable.
+  const recordable = !!sev.osha || (entry.daysLost > 0) || (entry.restrictedDutyDays > 0) || !!entry.sentToMedical;
+  const activeCol = entry.restrictedDutyDays > 0 && entry.severity !== 'LOST_TIME' && entry.severity !== 'FATAL'
+    ? 'I'
+    : (OSHA_CLASS_COLS.find(c => c.sev.includes(entry.severity))?.id || 'J');
+  const v = (x, fb = '—') => (x === 0 ? '0' : (x || fb));
+  const witnesses = Array.isArray(entry.witnessNames) ? entry.witnessNames.join(', ') : entry.witnessNames;
+
+  const Field = ({ label, children, full }) => (
+    <div className={full ? 'col-span-2' : ''}>
+      <div className="text-[9.5px] font-bold uppercase tracking-wide text-slate-400">{label}</div>
+      <div className="text-[12px] text-slate-800 mt-0.5 leading-snug">{children}</div>
+    </div>
+  );
+
+  return (
+    <>
+      <div className="fixed inset-0 bg-black/40 z-40" onClick={onClose} />
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-6 pointer-events-none">
+        <div className="bg-white rounded-2xl shadow-2xl flex flex-col pointer-events-auto max-h-[88vh]" style={{ width: 640 }}>
+          {/* Header */}
+          <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200">
+            <div className="flex items-center gap-2.5">
+              <div className="rounded-lg flex items-center justify-center" style={{ width: 34, height: 34, backgroundColor: PURPLE_LIGHT }}>
+                <Shield size={17} style={{ color: PURPLE_DEEP }} />
+              </div>
+              <div>
+                <div className="text-[15px] font-bold text-slate-900">OSHA Injury &amp; Illness Report</div>
+                <div className="text-[11px] text-slate-500">Case <strong className="text-slate-700">{oshaCaseNo(entry)}</strong> · {entry.title}</div>
+              </div>
+            </div>
+            <button onClick={onClose} className="rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center" style={{ width: 30, height: 30 }}>
+              <X size={13} className="text-slate-700" />
+            </button>
+          </div>
+
+          <div className="overflow-y-auto px-5 py-4 space-y-4">
+            {/* Recordability determination */}
+            <div className="rounded-xl p-3 flex items-start gap-2.5"
+              style={{ backgroundColor: recordable ? WARN_BG : SUCCESS_BG }}>
+              {recordable
+                ? <AlertTriangle size={16} className="mt-0.5 flex-shrink-0" style={{ color: WARN }} />
+                : <CheckCircle2 size={16} className="mt-0.5 flex-shrink-0" style={{ color: SUCCESS }} />}
+              <div>
+                <div className="text-[12px] font-bold" style={{ color: recordable ? WARN : SUCCESS }}>
+                  {recordable ? 'OSHA-recordable — must be logged on the OSHA 300 Log' : 'Not OSHA-recordable — internal record only'}
+                </div>
+                <div className="text-[11px] text-slate-600 mt-0.5">
+                  {recordable
+                    ? `Classified “${sev.label || entry.severity}”. Enter within 7 calendar days on the OSHA 300 Log; complete Form 301 below.`
+                    : `“${sev.label || entry.severity}” does not meet the recordable threshold (no medical treatment beyond first aid, no days away/restricted). Documented for internal safety tracking.`}
+                </div>
+              </div>
+            </div>
+
+            {/* OSHA Form 301 */}
+            <div className="rounded-xl border border-slate-200">
+              <div className="flex items-center gap-1.5 px-3 py-2 border-b border-slate-200 bg-slate-50 rounded-t-xl">
+                <FileText size={13} className="text-slate-500" />
+                <span className="text-[11px] font-bold text-slate-700">OSHA Form 301 · Injury and Illness Incident Report</span>
+              </div>
+              <div className="p-3.5 grid grid-cols-2 gap-x-4 gap-y-3">
+                <Field label="Establishment">{OSHA_ESTABLISHMENT.company}</Field>
+                <Field label="Case number">{oshaCaseNo(entry)}</Field>
+                <Field label="Site / location" full>{OSHA_ESTABLISHMENT.site}</Field>
+                <Field label="Injured / ill employee">{v(entry.injuredEmployee || entry.firstAidByWhom)}</Field>
+                <Field label="Date &amp; time of event">{v(entry.date || entry.time)}{entry.time && entry.date ? ` · ${entry.time}` : ''}</Field>
+                <Field label="Where the event occurred" full>{v(entry.location)}</Field>
+                <Field label="What was the employee doing before the incident" full>{v(entry.actionTaken)}</Field>
+                <Field label="What happened" full>{v(entry.description)}</Field>
+                <Field label="Injury / illness &amp; part of body">
+                  {sev.label || entry.severity}{entry.bodyPart ? ` — ${entry.bodyPart}` : ''}
+                </Field>
+                <Field label="Object / substance that harmed">{v(entry.cause || entry.equipmentInvolved)}</Field>
+                <Field label="Medical treatment">
+                  {entry.sentToMedical ? `Sent to ${v(entry.medicalLocation, 'medical facility')}` : (entry.firstAidByWhom ? `First aid by ${entry.firstAidByWhom}` : 'None beyond first aid')}
+                </Field>
+                <Field label="Witness(es)">{v(witnesses)}</Field>
+                <Field label="Days away from work">{v(entry.daysLost, '0')}</Field>
+                <Field label="Restricted / transfer days">{v(entry.restrictedDutyDays, '0')}</Field>
+                <Field label="Completed by">{v(entry.reportedBy)}</Field>
+                <Field label="Change-order trigger">{entry.changeOrderTrigger ? 'Yes' : 'No'}</Field>
+              </div>
+            </div>
+
+            {/* OSHA 300 Log line preview */}
+            <div className={cls('rounded-xl border', recordable ? 'border-slate-200' : 'border-slate-200 opacity-60')}>
+              <div className="flex items-center gap-1.5 px-3 py-2 border-b border-slate-200 bg-slate-50 rounded-t-xl">
+                <ClipboardList size={13} className="text-slate-500" />
+                <span className="text-[11px] font-bold text-slate-700">OSHA Form 300 · Log line entry</span>
+              </div>
+              <div className="p-3.5">
+                <div className="flex items-start gap-4 mb-3">
+                  <div className="min-w-0">
+                    <div className="text-[9.5px] font-bold uppercase tracking-wide text-slate-400">Case / Employee / Job title</div>
+                    <div className="text-[12px] text-slate-800 mt-0.5">{oshaCaseNo(entry)} · {v(entry.injuredEmployee || entry.firstAidByWhom)} · {v(entry.jobTitle, 'Field crew')}</div>
+                  </div>
+                  <div>
+                    <div className="text-[9.5px] font-bold uppercase tracking-wide text-slate-400">Date</div>
+                    <div className="text-[12px] text-slate-800 mt-0.5">{v(entry.date || entry.time)}</div>
+                  </div>
+                </div>
+                {/* Classification columns G–J */}
+                <div className="text-[9.5px] font-bold uppercase tracking-wide text-slate-400 mb-1.5">Classify the case (check the most serious outcome)</div>
+                <div className="grid grid-cols-4 gap-2">
+                  {OSHA_CLASS_COLS.map(c => {
+                    const on = recordable && c.id === activeCol;
+                    return (
+                      <div key={c.id} className={cls('rounded-lg border p-2 text-center', on ? 'border-transparent' : 'border-slate-200')}
+                        style={on ? { backgroundColor: PURPLE_LIGHT } : undefined}>
+                        <div className="flex items-center justify-center mb-1">
+                          <div className={cls('rounded flex items-center justify-center', on ? '' : 'border border-slate-300')} style={{ width: 16, height: 16, backgroundColor: on ? PURPLE : undefined }}>
+                            {on && <Check size={11} className="text-white" />}
+                          </div>
+                        </div>
+                        <div className="text-[9px] font-semibold text-slate-500">({c.id})</div>
+                        <div className={cls('text-[10px] leading-tight', on ? 'font-bold text-slate-900' : 'text-slate-500')}>{c.label}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {!recordable && <div className="text-[10.5px] text-slate-500 mt-2.5">Not added to the 300 Log — case is below the recordable threshold.</div>}
+              </div>
+            </div>
+          </div>
+
+          {/* Footer actions */}
+          <div className="px-5 py-3 border-t border-slate-200 flex items-center gap-2">
+            <div className="text-[10.5px] text-slate-500 flex items-center gap-1.5 flex-1">
+              <Info size={11} className="flex-shrink-0" />
+              {filed ? <span className="font-bold" style={{ color: SUCCESS }}>Recorded to OSHA log · {oshaCaseNo(entry)}</span> : <span>Pre-filled from the captured incident. Review before filing.</span>}
+            </div>
+            <button className="rounded-lg border border-slate-200 px-3 py-2 text-[11px] font-bold text-slate-700 hover:bg-slate-50 flex items-center gap-1.5">
+              <Download size={12} /> 301 PDF
+            </button>
+            <button
+              disabled={!recordable || filed}
+              onClick={() => setFiled(true)}
+              className="rounded-lg text-white px-3 py-2 text-[11px] font-bold flex items-center gap-1.5 disabled:bg-slate-300 disabled:cursor-not-allowed"
+              style={{ backgroundColor: (!recordable || filed) ? undefined : PURPLE }}>
+              {filed ? <><Check size={12} /> Added to 300 Log</> : <><FileSignature size={12} /> Add to OSHA 300 Log</>}
+            </button>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+};
+
 const IncidentDelayRow = ({ entry }) => {
   const [addOpen, setAddOpen] = useState(false);
+  const [oshaOpen, setOshaOpen] = useState(false);
   const [items, setItems] = useState(entry.attachments || []);
   const isIncident = entry.kind === 'INCIDENT';
+  const oshaRecordable = isIncident && (SEV_META[entry.severity]?.osha || entry.daysLost > 0 || entry.restrictedDutyDays > 0 || entry.sentToMedical);
   return (
     <Card>
       <div className="flex items-center gap-2 mb-2 flex-wrap">
@@ -2548,6 +2721,8 @@ const IncidentDelayRow = ({ entry }) => {
         {isIncident && entry.severity && <Badge tone="slate">{SEV_META[entry.severity]?.label || entry.severity}</Badge>}
         {!isIncident && entry.category && <Badge tone="slate">{entry.category}</Badge>}
         <Badge tone={entry.status === 'OPEN' ? 'amber' : 'green'}>{entry.status}</Badge>
+        {oshaRecordable && <Badge tone="amber">🛡 OSHA recordable</Badge>}
+        {entry.reportedToOsha && <Badge tone="green">✓ Reported to OSHA</Badge>}
         {entry.changeOrderTrigger && <Badge tone="amber">⚡ Change-order trigger</Badge>}
         <SourcePill aiSource={entry.aiSource} confidence={entry.confidence} />
         <span className="text-[11px] text-slate-500 ml-auto">{entry.time} · by {entry.reportedBy}</span>
@@ -2568,7 +2743,20 @@ const IncidentDelayRow = ({ entry }) => {
       )}
       <NotesExcerpt notes={entry.notes} />
       <MediaAttachments items={items} onAdd={() => setAddOpen(true)} label="Photo / video evidence" />
+      {isIncident && (
+        <div className="mt-2.5 flex items-center gap-2">
+          <button onClick={() => setOshaOpen(true)}
+            className="rounded-lg border px-3 py-1.5 text-[11px] font-bold flex items-center gap-1.5 transition-colors"
+            style={oshaRecordable
+              ? { backgroundColor: WARN_BG, borderColor: 'transparent', color: WARN }
+              : { borderColor: '#E2E8F0', color: '#475569' }}>
+            <Shield size={12} /> Generate OSHA report
+          </button>
+          {oshaRecordable && <span className="text-[10.5px] text-slate-500">Recordable — 300 Log entry required</span>}
+        </div>
+      )}
       {addOpen && <AddMediaDialog target={entry.title} onClose={() => setAddOpen(false)} onAdd={(src) => setItems(prev => [...prev, { id: `id-new-${Date.now()}`, kind: src === 'video' ? 'video' : 'photo', label: `New ${src}`, placeholder: 'ebox-after', durationSec: src === 'video' ? 15 : undefined }])} />}
+      {oshaOpen && <OSHAReportDialog entry={entry} onClose={() => setOshaOpen(false)} />}
     </Card>
   );
 };
